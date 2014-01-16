@@ -21,6 +21,9 @@
 # 20140109-001
 #	Initial version
 #
+# 20140116-001
+#	When inserting image reference, take care of encoding used!
+#
 ################################################################################
 
 import argparse
@@ -62,15 +65,15 @@ RECEIVER_BLACK_LIST = []
 # but with it we can conclude if there is newer image to be added!
 #
 BASE_IMG_FILENAME = "reklamasistemnet.jpg" # No path is allowed here!!!
-IMG_FILENAME = "0000000000.reklamasistemnet.jpg" # No path is allowed here!!!
+IMG_FILENAME = "00reklamasistemnet.jpg" # No path is allowed here!!!
 IMG_PATH = "/opt/zimbra/altermime/bin/"	# Path to the picture! It HAS TO END WITH FORWARD SLASH!!
 
 # If True, no message will be modified. Useful for debugging purposes.
-DRY_RUN = False
+DRY_RUN = True
 
 # For debugging purposes. 0 -> no debugging at all, 3 highest debugging
 # level.
-DEBUG_LEVEL = 1
+DEBUG_LEVEL = 4
 
 # Placehoder string within the attachment (or in general somewhere within
 # the mail where image should appear) that will be changed when image is
@@ -79,7 +82,10 @@ DEBUG_LEVEL = 1
 # Note that placeholder has to be comment so that it isn't displayed in case
 # no image is attached!
 IMGPLACEHOLDER = '<!-- IMAGEHEREPLACEHOLDER -->'
-IMGLINK = '<br /><img src="cid:' + BASE_IMG_FILENAME + '@sistemnet.hr"><br />'
+IMGLINK = {
+	'7bit':			'<br /><img src="cid:' + BASE_IMG_FILENAME + '@sistemnet.hr"><br />\r\n',
+	'quoted-printable':	'<br /><img src=3D"cid:' + BASE_IMG_FILENAME + '@sistemnet.hr"><br />\r\n'
+}
 
 def debug(level, msg):
 	if level <= DEBUG_LEVEL:
@@ -153,14 +159,29 @@ def isHTMLWithSignature(msg):
 	Check if the given message part (that must not be multipart) is
 	text/html with a signature in it!
 	"""
-	return msg.get_content_type() == "text/html"
+	if msg.get_content_type() != "text/html":
+		return False
+
+	return True
 
 def processMessagePart(parentContentType, msgPart):
 
 	if not isHTMLWithSignature(msgPart):
-		return [msgPart]
+		return []
 
-	msgPart.set_payload(msgPart.get_payload().replace(IMGPLACEHOLDER, IMGLINK))
+	oldHTMLPart = msgPart.get_payload()
+	try:
+		contentTransferEncoding = msgPart['Content-Transfer-Encoding']
+		newHTMLPart = oldHTMLPart.replace(IMGPLACEHOLDER, IMGLINK[contentTransferEncoding])
+	except KeyError:
+		debug(0, "Unknown Content-Transfer-Encoding value {0}".format(contentTransferEncoding))
+		return []
+
+	if oldHTMLPart == newHTMLPart:
+		debug(3, "No replace was done in text/html part of the message")
+		return []
+
+	msgPart.set_payload(newHTMLPart)
 
 	img = MIMEImage(open(IMG_PATH + IMG_FILENAME).read())
 	img.add_header('Content-Disposition', 'attachment', filename=IMG_FILENAME)
@@ -185,15 +206,23 @@ def processMessagePart(parentContentType, msgPart):
 def processMultipartMessage(msgPart):
 
 	newParts = []
+	replaced = False
 	for msg in msgPart.get_payload():
 
 		if msg.is_multipart():
-			processMultipartMessage(msg)
+			replaced |= processMultipartMessage(msg)
 			newParts.append(msg)
 		else:
-			newParts.extend(processMessagePart(msgPart.get_content_type(), msg))
+			newList = processMessagePart(msgPart.get_content_type(), msg)
+			if newList != []:
+				replaced = True
+				newParts.extend(newList)
+			else:
+				newParts.append(msg)
 
 	msgPart.set_payload(newParts)
+
+	return replaced
 
 def processMailFile(fileName):
 	# Open mail
@@ -262,7 +291,7 @@ def processMailFile(fileName):
 	# Check if attachment is already there. If so, don't
 	# do anything with it, only replace it with newer version
 	########################################################################
-	debug(3, "Checking if attachment already exists")
+	debug(2, "Checking if attachment already exists")
 
 	found, changed, newPayload = checkSubparts(mainMsg)
 	if found:
@@ -276,15 +305,20 @@ def processMailFile(fileName):
 	# No attachment so recreate a message
 	########################################################################
 	debug(3, "No existing attachment version, recreating message to include one")
-	processMultipartMessage(mainMsg)
+	replaced = processMultipartMessage(mainMsg)
 
 	########################################################################
 	# Finally, add the message to the mail, and save new version of the
 	# mail message
 	########################################################################
-	debug(1, "Inserting image into mail message.")
 	if not DRY_RUN:
-		open(fileName, 'w').write(mainMsg.as_string())
+		if replaced:
+			debug(2, "Inserting image into mail message.")
+			open(fileName, 'w').write(mainMsg.as_string())
+		else:
+			debug(3, "No image attached! Probably old disclaimer without image reference.")
+	else:
+		debug(1, "Dry run specified. Message wasn't changed!")
 
 def main():
 

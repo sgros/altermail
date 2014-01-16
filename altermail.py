@@ -22,19 +22,30 @@
 #	Initial version
 #
 # 20140116-001
-#	When inserting image reference, take care of encoding used!
+#       When inserting image reference, take care of encoding used!
+#
+# 20140116-002
+#       Added ability to save messages before and after processing
+#	When error occurs dump message into a separate file for a later analysis
+#	Use local time instead of gmtime for log messages
+#	Introduced functionality to prevent attaching image for internal mail messages
+#	Reorganized code for black and white lists
 #
 ################################################################################
 
 import argparse
 import sys
-from time import gmtime, strftime
+from time import localtime, strftime
 import re
 
 from email.parser import Parser
 from email import header
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
+
+# What is my domain? The idea is that messages internal to the domain
+# should not be modified!
+MY_DOMAIN = "@sistemnet.hr"
 
 # From mail addresses that MUST NOT have appended attachment. This list
 # has priority, i.e. if mail address is found in this list no attachment
@@ -64,8 +75,8 @@ RECEIVER_BLACK_LIST = []
 # Filename MUST CONTAIN VERSION which will not be added to the message
 # but with it we can conclude if there is newer image to be added!
 #
-BASE_IMG_FILENAME = "reklamasistemnet.jpg" # No path is allowed here!!!
-IMG_FILENAME = "00reklamasistemnet.jpg" # No path is allowed here!!!
+BASE_IMG_FILENAME = "ponudasistemnet.jpg" # No path is allowed here!!!
+IMG_FILENAME = "00ponudasistemnet.jpg" # No path is allowed here!!!
 IMG_PATH = "/opt/zimbra/altermime/bin/"	# Path to the picture! It HAS TO END WITH FORWARD SLASH!!
 
 # If True, no message will be modified. Useful for debugging purposes.
@@ -74,6 +85,10 @@ DRY_RUN = True
 # For debugging purposes. 0 -> no debugging at all, 3 highest debugging
 # level.
 DEBUG_LEVEL = 4
+
+# Should processed mails be saved for a later analysis?
+SAVE_PROCESSED_MAILS = False
+SAVE_DIRECTORY = "/tmp/" # It has to end with slash!
 
 # Placehoder string within the attachment (or in general somewhere within
 # the mail where image should appear) that will be changed when image is
@@ -89,7 +104,7 @@ IMGLINK = {
 
 def debug(level, msg):
 	if level <= DEBUG_LEVEL:
-		print "{0} LEVEL{1} {2}".format(strftime("%d %b %Y %H:%M:%S +0000", gmtime()), level, msg)
+		print "{0} LEVEL{1} {2}".format(strftime("%d %b %Y %H:%M:%S", localtime()), level, msg)
 
 def replaceImageIfNecessary(msgPart):
 	"""
@@ -242,50 +257,105 @@ def processMailFile(fileName):
 		return
 
 	########################################################################
-	# Check sender white and black lists
+	# Create a lists of senders and recepients!
 	########################################################################
-	white_found = black_found = False
-	debug(3, "Check sender white and black lists")
-	for v, t in header.decode_header(mainMsg['From']):
-		debug(3, v)
+	fromStr = mainMsg['From']
+	debug(4, "FROM string: {0}".format(fromStr))
+	fromList = []
+	if fromStr:
+		fromList = re.findall('<[^ <]+@[^ >,]+>', fromStr)
+		if fromList == []:
+			fromList = re.findall('[^ <]+@[^ >,]+', fromStr)
+	debug(3, "Discovered sender: {0}".format(str(fromList)))
 
-		for w in SENDER_WHITE_LIST:
-			try:
-				if v.index(w) >= 0: white_found = True
-				debug(3, "In From header field found sender {} from the white list".format(w))
-			except ValueError:
-				pass
+	toStr = mainMsg['To']
+	debug(4, "TO string: {0}".format(toStr))
+	toList = []
+	if toStr:
+		toList = re.findall('<[^ <]+@[^ >,]+>', toStr)
+		if toList == []:
+			toList = re.findall('[^ <]+@[^ >,]+', toStr)
 
+	ccStr = mainMsg['Cc']
+	debug(4, "CC string: {0}".format(ccStr))
+	ccList = []
+	if ccStr:
+		ccList = re.findall('<[^ <]+@[^ >,]+>', ccStr)
+		if ccList == []:
+			ccList = re.findall('[^ <]+@[^ >,]+', ccStr)
+
+	toList.extend(ccList)
+	debug(3, "Discovered recipients: {0}".format(str(toList)))
+
+	########################################################################
+	# Check if this is an internal mail. If so, don't do anything
+	# with a message
+	########################################################################
+	try:
+		for mailAddress in toList:
+			mailAddress.index(MY_DOMAIN)
+
+		debug(1, "Internal mail message. Skipping.")
+
+		return
+
+	except ValueError:
+		debug(1, "Found external mail address.")
+
+	########################################################################
+	# Check blacklisted sender. If there is one, just skip further
+	# processing
+	########################################################################
+	for mailAddress in toList:
 		for b in SENDER_BLACK_LIST:
 			try:
-				if v.index(b) >= 0: black_found = True
+				mailAddress.index(b)
 				debug(3, "In From header field found sender {} from the black list".format(b))
+
+				debug(2, "Sender in the black list. Stopping.")
+				return
 			except ValueError:
 				pass
 
-	if black_found:
-		debug(2, "Sender in the black list. Stopping.")
-		return
+	########################################################################
+	# Check white list
+	########################################################################
+	if len(SENDER_WHITE_LIST):
+		white_found = False
+		for mailAddress in toList:
 
-	if not white_found and len(SENDER_WHITE_LIST) > 0:
-		debug(2, "White list specified without sender of the current message in the list. Stopping.")
-		return
+			for w in SENDER_WHITE_LIST:
+				try:
+					mailAddress.index(w)
+					white_found = True
+
+					debug(3, "In From header field found sender {} from the white list".format(w))
+					break
+
+				except ValueError:
+					pass
+
+			if white_found:
+				break
+
+		if not white_found:
+			debug(2, "White list specified without sender of the current message in the list. Stopping.")
+			return
 
 	########################################################################
-	# Check receiver black lists
+	# Check blacklisted receiver. If there is one, just skip further
+	# processing
 	########################################################################
-	black_found = False
-	toHeader = mainMsg['To']
-	for rb in RECEIVER_BLACK_LIST:
-		try:
-			if toHeader.index(rb) >= 0: black_found = True
-			debug(3, "In To header field found receiver {} from the black list".format(rb))
-		except ValueError:
-			pass
+	for mailAddress in toList:
+		for b in RECEIVER_BLACK_LIST:
+			try:
+				mailAddress.index(b)
+				debug(3, "In From header field found receiver {} from the black list".format(b))
 
-	if black_found:
-		debug(2, "Blacklisted receiver found. Stopped further processing.")
-		return
+				debug(2, "Receiver in the black list. Stopping.")
+				return
+			except ValueError:
+				pass
 
 	########################################################################
 	# Check if attachment is already there. If so, don't
@@ -316,7 +386,7 @@ def processMailFile(fileName):
 			debug(2, "Inserting image into mail message.")
 			open(fileName, 'w').write(mainMsg.as_string())
 		else:
-			debug(3, "No image attached! Probably old disclaimer without image reference.")
+			debug(3, "Probably old disclaimer without image reference. No image attached!")
 	else:
 		debug(1, "Dry run specified. Message wasn't changed!")
 
@@ -330,7 +400,20 @@ def main():
 
 	args = parser.parse_args()
 
-	processMailFile(args.input)
+	try:
+		if SAVE_PROCESSED_MAILS:
+			baseFileName = strftime("%Y%b%d%H%M%S", localtime())
+			open(SAVE_DIRECTORY + baseFileName + ".input.eml", 'w').write(open(args.input).read())
+
+		processMailFile(args.input)
+
+		if SAVE_PROCESSED_MAILS:
+			open(SAVE_DIRECTORY + baseFileName + ".output.eml", 'w').write(open(args.input).read())
+
+	except Exception as ex:
+		print ex
+		baseFileName = strftime("%Y%b%d%H%M%S", localtime())
+		open(SAVE_DIRECTORY + baseFileName + ".error.eml", 'w').write(open(args.input).read())
 
 if __name__ == '__main__':
 	main()
